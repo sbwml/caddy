@@ -15,8 +15,10 @@
 package logging
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -24,6 +26,8 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+
+	"github.com/rosedblabs/wal"
 )
 
 func init() {
@@ -46,6 +50,8 @@ type NetWriter struct {
 	SoftStart bool `json:"soft_start,omitempty"`
 
 	addr caddy.NetworkAddress
+	w    *wal.WAL
+	wr   *wal.Reader
 }
 
 // CaddyModule returns the Caddy module information.
@@ -89,8 +95,25 @@ func (nw NetWriter) WriterKey() string {
 	return nw.addr.String()
 }
 
+func getPool() []byte {
+	return make([]byte, 1024)
+}
+
 // OpenWriter opens a new network connection.
-func (nw NetWriter) OpenWriter() (io.WriteCloser, error) {
+func (nw *NetWriter) OpenWriter() (io.WriteCloser, error) {
+	if err := os.MkdirAll(caddy.AppDataDir()+"/wal", 0o755); err != nil {
+		return nil, err
+	}
+	opts := wal.DefaultOptions
+	opts.DirPath = caddy.AppDataDir() + "/wal"
+	opts.Sync = true
+	opts.SegmentSize = wal.KB
+	opts.BlockCache = wal.KB / 2
+	w, err := wal.Open(opts)
+	if err != nil {
+		return nil, err
+	}
+	nw.w, nw.wr = w, w.NewReader()
 	reconn := &redialerConn{
 		nw:      nw,
 		timeout: time.Duration(nw.DialTimeout),
@@ -107,7 +130,31 @@ func (nw NetWriter) OpenWriter() (io.WriteCloser, error) {
 	reconn.connMu.Lock()
 	reconn.Conn = conn
 	reconn.connMu.Unlock()
+	go reconn.readWal()
 	return reconn, nil
+}
+
+func (rc *redialerConn) readWal() {
+	for {
+		data, _, err := rc.nw.wr.Next()
+		if err == io.EOF {
+			continue
+		}
+		if err == wal.ErrClosed {
+			log.Printf("wal closed")
+			return
+		}
+		if err != nil {
+			log.Printf("error reading from wal: %v", err)
+			continue
+		}
+		log.Printf("trying to write")
+		log.Printf("data is: %s", string(data))
+		for _, err := rc.write(data); err != nil; _, err = rc.write(data) {
+			log.Printf("failed to write: %s", err)
+			time.Sleep(time.Second)
+		}
+	}
 }
 
 // UnmarshalCaddyfile sets up the handler from Caddyfile tokens. Syntax:
@@ -156,14 +203,20 @@ func (nw *NetWriter) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 type redialerConn struct {
 	net.Conn
 	connMu     sync.RWMutex
-	nw         NetWriter
+	nw         *NetWriter
 	timeout    time.Duration
 	lastRedial time.Time
 }
 
+func (reconn *redialerConn) Write(b []byte) (n int, err error) {
+	_, err = reconn.nw.w.Write(b)
+	reconn.nw.w.Sync()
+	return len(b), err
+}
+
 // Write wraps the underlying Conn.Write method, but if that fails,
 // it will re-dial the connection anew and try writing again.
-func (reconn *redialerConn) Write(b []byte) (n int, err error) {
+func (reconn *redialerConn) write(b []byte) (n int, err error) {
 	reconn.connMu.RLock()
 	conn := reconn.Conn
 	reconn.connMu.RUnlock()
@@ -195,6 +248,7 @@ func (reconn *redialerConn) Write(b []byte) (n int, err error) {
 		if err2 != nil {
 			// logger socket still offline; instead of discarding the log, dump it to stderr
 			os.Stderr.Write(b)
+			err = err2
 			return
 		}
 		if n, err = conn2.Write(b); err == nil {
@@ -203,12 +257,18 @@ func (reconn *redialerConn) Write(b []byte) (n int, err error) {
 			}
 			reconn.Conn = conn2
 		}
-	} else {
-		// last redial attempt was too recent; just dump to stderr for now
-		os.Stderr.Write(b)
 	}
 
 	return
+}
+
+func (reconn *redialerConn) Close() error {
+	return errors.Join(
+		reconn.nw.w.Sync(),
+		reconn.nw.w.Close(),
+		reconn.nw.w.Delete(),
+		reconn.Conn.Close(),
+	)
 }
 
 func (reconn *redialerConn) dial() (net.Conn, error) {
