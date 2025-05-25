@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/facette/natsort"
 	"github.com/dustin/go-humanize"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
@@ -329,7 +330,7 @@ func (l byName) Len() int      { return len(l.Items) }
 func (l byName) Swap(i, j int) { l.Items[i], l.Items[j] = l.Items[j], l.Items[i] }
 
 func (l byName) Less(i, j int) bool {
-	return strings.ToLower(l.Items[i].Name) < strings.ToLower(l.Items[j].Name)
+	return natsort.Compare(l.Items[i].Name, l.Items[j].Name)
 }
 
 func (l byNameDirFirst) Len() int      { return len(l.Items) }
